@@ -102,7 +102,7 @@
     }
   }
 
-  function showConfirmation(data, id) {
+  function showConfirmation(data, id, emailWarning) {
     var values = {
       name: data.name,
       email: data.email,
@@ -115,6 +115,10 @@
     confirmBox.querySelectorAll('[data-c]').forEach(function (el) {
       el.textContent = values[el.getAttribute('data-c')] || '';
     });
+    var emailStatus = document.getElementById('confirm-email-status');
+    emailStatus.textContent = emailWarning
+      ? 'Your request is saved, but we could not confirm the email was delivered. Our team will follow up with your ride details.'
+      : "We've sent a confirmation to " + data.email + ". You'll receive another email with your ride details once we've confirmed your rider and fare.";
     form.hidden = true;
     confirmBox.hidden = false;
     card.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -153,7 +157,7 @@
       })
       .then(function (r) {
         if (r.res.ok && r.out && r.out.ok) {
-          showConfirmation(data, r.out.id);
+          showConfirmation(data, r.out.id, r.out.emailWarning);
           return;
         }
         if (r.out && r.out.error === 'invalid' && Array.isArray(r.out.fields) && r.out.fields.length) {

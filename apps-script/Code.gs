@@ -1,18 +1,11 @@
 /**
- * Biken ride requests
+ * Biken email notifications
  *
- * Receives ride requests from the Biken website, saves each one as a row on the
- * "Requests" tab of the Biken Ride Requests sheet, and sends the emails:
- *   1. To the customer, straight away: "We've received your ride request".
- *   2. To Biken, straight away: a new-request notification.
- *   3. To the customer, when a coordinator sets Status to "Confirmed" and has
- *      filled in Rider and Fare: "Your Biken ride is confirmed" with the details.
+ * Sends email notifications for ride requests stored in Supabase.
  *
- * Setup steps are in the README of the website project.
+ * Ride requests and status updates are managed in Supabase and the admin site.
  */
 
-const SHEET_ID = '1WuuiJXybo2EIIGlIsT28IaEougBVbSeD00dnfKpSZLI';
-const TAB = 'Requests';
 const TIMEZONE = 'Africa/Kigali';
 const LANGUAGES = ['English', 'French', 'Kiswahili', 'Kinyarwanda'];
 
@@ -20,15 +13,7 @@ const LANGUAGES = ['English', 'French', 'Kiswahili', 'Kinyarwanda'];
 // customer replies to one of our emails, the reply goes here too.
 const TEAM_EMAILS = ['h.bello@alustudent.com', 't.oteniya@alustudent.com'];
 
-// Column positions on the Requests tab (1-based).
-const COL = {
-  submitted: 1, id: 2, name: 3, email: 4, phone: 5, pickup: 6, destination: 7,
-  date: 8, time: 9, language: 10, status: 11, rider: 12, riderPhone: 13,
-  fare: 14, notes: 15, emailed: 16
-};
-const WIDTH = 16;
-
-/* ---------- Website requests ---------- */
+/* ---------- Notification requests ---------- */
 
 function doPost(e) {
   try {
@@ -40,18 +25,43 @@ function doPost(e) {
     const problems = validate_(r);
     if (problems.length) return json_({ ok: false, error: 'invalid', fields: problems });
 
-    const id = makeId_();
-    const lock = LockService.getScriptLock();
-    lock.waitLock(20000);
-    try {
-      appendRequest_(r, id);
-    } finally {
-      lock.releaseLock();
+    if (body.action === 'request_received') {
+      if (!body.id) return json_({ ok: false, error: 'invalid', fields: ['id'] });
+      let customerEmailSent = true;
+      let teamEmailSent = true;
+      try { sendReceived_(r, String(body.id).slice(0, 40)); }
+      catch (err) { customerEmailSent = false; console.error('Customer email failed', err); }
+      try { notifyTeam_(r, String(body.id).slice(0, 40)); }
+      catch (err) { teamEmailSent = false; console.error('Team email failed', err); }
+      return json_({ ok: true, customerEmailSent: customerEmailSent, teamEmailSent: teamEmailSent });
     }
 
-    try { sendReceived_(r, id); } catch (err) { console.error('Customer email failed', err); }
-    try { notifyTeam_(r, id); } catch (err) { console.error('Team email failed', err); }
-    return json_({ ok: true, id: id });
+    if (body.action === 'ride_confirmed') {
+      const rider = String(body.rider || '').trim().slice(0, 200);
+      const fare = Number(body.fare);
+      if (!body.id || !rider || !Number.isFinite(fare) || fare < 0) {
+        return json_({ ok: false, error: 'invalid', fields: ['id', 'rider', 'fare'] });
+      }
+      try {
+        sendConfirmed_({
+        id: String(body.id).slice(0, 40),
+        name: r.name,
+        email: r.email,
+        pickup: r.pickup,
+        destination: r.destination,
+        when: whenLabel_(r.dateLabel, r.time),
+        rider: rider,
+        riderPhone: String(body.rider_phone || '').trim().slice(0, 40),
+        fare: fare
+        });
+        return json_({ ok: true, emailSent: true });
+      } catch (err) {
+        console.error('Confirmation email failed', err);
+        return json_({ ok: true, emailSent: false });
+      }
+    }
+
+    return json_({ ok: false, error: 'invalid_action' });
   } catch (err) {
     console.error(err);
     return json_({ ok: false, error: 'server' });
@@ -59,81 +69,12 @@ function doPost(e) {
 }
 
 function doGet() {
-  return json_({ ok: true, service: 'Biken ride requests' });
-}
-
-function appendRequest_(r, id) {
-  const sh = sheet_();
-  const row = sh.getLastRow() + 1;
-  if (row > sh.getMaxRows()) sh.insertRowsAfter(sh.getMaxRows(), 200);
-  const range = sh.getRange(row, 1, 1, WIDTH);
-  const formats = new Array(WIDTH).fill('@');
-  formats[COL.submitted - 1] = 'ddd d mmm yyyy, hh:mm';
-  formats[COL.fare - 1] = '#,##0';
-  range.setNumberFormats([formats]);
-  range.setValues([[
-    new Date(), id, safe_(r.name), safe_(r.email), r.phone, safe_(r.pickup), safe_(r.destination),
-    r.dateLabel, r.time, r.language, 'New', '', '', '', '', ''
-  ]]);
-  const rule = sh.getRange(2, COL.status).getDataValidation();
-  if (rule) sh.getRange(row, COL.status).setDataValidation(rule);
-}
-
-/* ---------- Confirmed rides ---------- */
-
-// Runs on every edit of the sheet (installed by setup()). When a row on the
-// Requests tab is Confirmed and has a Rider and a Fare, the customer is emailed
-// their ride details once. Clear "Ride details emailed" to send them again.
-function onRequestEdit(e) {
-  if (!e || !e.range) return;
-  const sh = e.range.getSheet();
-  if (sh.getName() !== TAB) return;
-  if (e.range.getLastColumn() < COL.status || e.range.getColumn() > COL.emailed) return;
-
-  const first = Math.max(2, e.range.getRow());
-  const last = e.range.getLastRow();
-  for (let row = first; row <= last; row++) {
-    const v = sh.getRange(row, 1, 1, WIDTH).getValues()[0];
-    if (String(v[COL.status - 1]).trim() !== 'Confirmed') continue;
-    const emailed = String(v[COL.emailed - 1] || '');
-    if (emailed.indexOf('Sent') === 0) continue;
-
-    const rider = String(v[COL.rider - 1] || '').trim();
-    const fare = v[COL.fare - 1];
-    const email = String(v[COL.email - 1] || '').trim();
-    const cell = sh.getRange(row, COL.emailed);
-    if (!rider || fare === '' || fare === null) {
-      cell.setValue('Not sent yet: add Rider and Fare');
-      continue;
-    }
-    if (!email) {
-      cell.setValue('Not sent: no customer email');
-      continue;
-    }
-    try {
-      sendConfirmed_({
-        id: String(v[COL.id - 1]),
-        name: String(v[COL.name - 1]),
-        email: email,
-        pickup: String(v[COL.pickup - 1]),
-        destination: String(v[COL.destination - 1]),
-        when: whenLabel_(String(v[COL.date - 1]), String(v[COL.time - 1])),
-        rider: rider,
-        riderPhone: String(v[COL.riderPhone - 1] || '').trim(),
-        fare: fare
-      });
-      cell.setValue('Sent ' + Utilities.formatDate(new Date(), TIMEZONE, 'd MMM yyyy, HH:mm'));
-    } catch (err) {
-      console.error(err);
-      cell.setValue('Not sent: email failed, try again');
-    }
-  }
+  return json_({ ok: true, service: 'Biken email notifications' });
 }
 
 /* ---------- One-time setup and testing ---------- */
 
-// Run once from the Apps Script editor. It creates the shared secret (shown in
-// the execution log, for Vercel) and the trigger that emails confirmed rides.
+// Run once from the Apps Script editor and copy the secret into both Vercel projects.
 function setup() {
   const props = PropertiesService.getScriptProperties();
   let secret = props.getProperty('SHARED_SECRET');
@@ -144,7 +85,6 @@ function setup() {
   ScriptApp.getProjectTriggers()
     .filter(function (t) { return t.getHandlerFunction() === 'onRequestEdit'; })
     .forEach(function (t) { ScriptApp.deleteTrigger(t); });
-  ScriptApp.newTrigger('onRequestEdit').forSpreadsheet(SpreadsheetApp.openById(SHEET_ID)).onEdit().create();
   console.log('Setup done. Copy this value into Vercel as SHARED_SECRET:\n' + secret);
 }
 
@@ -153,7 +93,9 @@ function testRequest() {
   const me = Session.getEffectiveUser().getEmail();
   const today = Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd');
   const res = doPost({ postData: { contents: JSON.stringify({
+    action: 'request_received',
     secret: PropertiesService.getScriptProperties().getProperty('SHARED_SECRET'),
+    id: 'BK-TEST-000',
     name: 'Test', email: me, phone: '0788000000', pickup: 'Kimironko Market',
     destination: 'Kigali Convention Centre', date: today, time: '08:30', language: 'English'
   }) } });
@@ -203,13 +145,13 @@ function notifyTeam_(r, id) {
   const to = PropertiesService.getScriptProperties().getProperty('NOTIFY_EMAIL') || TEAM_EMAILS.join(',');
   if (!to) return;
   const when = whenLabel_(r.dateLabel, r.time);
-  const url = SpreadsheetApp.openById(SHEET_ID).getUrl();
+  const adminUrl = PropertiesService.getScriptProperties().getProperty('ADMIN_URL');
   const lines = [
     'New ride request ' + id, '',
     'Name: ' + r.name, 'Email: ' + r.email, 'Phone: ' + r.phone,
-    'Pickup: ' + r.pickup, 'Destination: ' + r.destination, 'When: ' + when, 'Language: ' + r.language, '',
-    'Open the sheet: ' + url
+    'Pickup: ' + r.pickup, 'Destination: ' + r.destination, 'When: ' + when, 'Language: ' + r.language
   ];
+  if (adminUrl) lines.push('', 'Open Biken Admin: ' + adminUrl);
   MailApp.sendEmail({
     to: to,
     subject: 'New ride request: ' + r.name + ', ' + when,
@@ -249,12 +191,6 @@ function htmlEmail_(title, name, intro, rows, next, outro) {
 
 /* ---------- Helpers ---------- */
 
-function sheet_() {
-  const sh = SpreadsheetApp.openById(SHEET_ID).getSheetByName(TAB);
-  if (!sh) throw new Error('Tab "' + TAB + '" not found');
-  return sh;
-}
-
 function clean_(b) {
   const s = function (v) { return String(v == null ? '' : v).replace(/[\u0000-\u001F]/g, ' ').trim().slice(0, 200); };
   const r = {
@@ -284,21 +220,9 @@ function whenLabel_(dateLabel, time) {
   return dateLabel + (time ? ' at ' + time : '');
 }
 
-function makeId_() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let tail = '';
-  for (let i = 0; i < 3; i++) tail += chars.charAt(Math.floor(Math.random() * chars.length));
-  return 'BK-' + Utilities.formatDate(new Date(), TIMEZONE, 'yyMMdd') + '-' + tail;
-}
-
 function formatFare_(fare) {
   const n = Number(String(fare).replace(/[^0-9.]/g, ''));
   return isNaN(n) || !String(fare).trim() ? String(fare) : n.toLocaleString('en-US') + ' RWF';
-}
-
-// Text that starts with = + - or @ could be read as a formula by Sheets.
-function safe_(v) {
-  return /^[=+\-@]/.test(v) ? '’' + v : v;
 }
 
 function esc_(v) {

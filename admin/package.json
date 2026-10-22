@@ -1,0 +1,19 @@
+{
+  "name": "biken-admin",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'No build step required'",
+    "deploy": "vercel --prod",
+    "create-admin": "node scripts/create-admin.mjs",
+    "import-requests": "node scripts/import-requests.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "bcryptjs": "^2.4.3"
+  },
+  "devDependencies": {
+    "vercel": "^37.0.0"
+  }
+}
